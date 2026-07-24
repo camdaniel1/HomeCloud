@@ -1,0 +1,22 @@
+# docker/Dockerfile.dashboard-api
+FROM debian:12-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY common/ common/
+COPY ingestion-service/src/database.hpp ingestion-service/src/database.hpp
+COPY dashboard-api/ dashboard-api/
+RUN mkdir -p /src/build && g++ -std=c++17 -O0 -g \
+    -o /src/build/dashboard-api dashboard-api/src/main.cpp -pthread
+
+FROM debian:12-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 curl procps iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/build/dashboard-api /usr/local/bin/dashboard-api
+USER 10001:10001
+ENV LISTEN_PORT=8080 \
+    RAID_MOUNT_PATH=/data/ingest \
+    CACHE_TTL_MS=2000
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/dashboard-api"]

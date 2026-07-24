@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-service
+  namespace: iot-pipeline
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ingestion-service
+  template:
+    metadata:
+      labels:
+        app: ingestion-service
+    spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: ingestion-service
+          image: iot/ingestion-service:latest
+          ports:
+            - containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+            - secretRef:
+                name: sql-server-credentials
+          env:
+            - name: LISTEN_PORT
+              value: "9000"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: raid-storage
+              mountPath: /data/ingest
+          resources:
+            requests: { cpu: "100m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          readinessProbe:
+            tcpSocket: { port: 9000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 9000 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: raid-storage
+          persistentVolumeClaim:
+            claimName: raid-ingest-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-service
+  namespace: iot-pipeline
+spec:
+  selector:
+    app: ingestion-service
+  ports:
+    - port: 9000
+      targetPort: 9000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingestion-service-hpa
+  namespace: iot-pipeline
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingestion-service
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

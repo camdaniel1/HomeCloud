@@ -1,0 +1,46 @@
+# The underlying nodes expose a fault-tolerant mdadm RAID (RAID 10 or RAID 6 --
+# see scripts/setup-raid.sh) as local-path storage. This StorageClass just
+# names that RAID array so PVCs land on it; the fault tolerance itself lives
+# at the disk layer (see docs/RAID.md), not in Kubernetes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: raid-backed-storage
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raid-ingest-pv
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: raid-backed-storage
+  local:
+    path: /mnt/raid-array/ingest   # mount point of the mdadm RAID array, see docs/RAID.md
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - k8s-storage-node-1   # replace with your RAID-equipped node(s)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: raid-ingest-pvc
+  namespace: iot-pipeline
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: raid-backed-storage
+  resources:
+    requests:
+      storage: 200Gi

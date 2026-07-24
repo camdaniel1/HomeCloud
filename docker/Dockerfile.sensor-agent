@@ -1,0 +1,35 @@
+# docker/Dockerfile.sensor-agent
+# Straightforward native build. Docker automatically builds for the current
+# machine architecture, including ARM when this runs directly on a Raspberry Pi.
+FROM debian:12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY common/ common/
+COPY sensor-agent/ sensor-agent/
+RUN mkdir -p /out && g++ -std=c++17 -O0 -g \
+        -o /out/sensor-agent \
+        sensor-agent/src/main.cpp -pthread
+
+FROM debian:12-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -M -u 10001 sensoragent
+COPY --from=builder /out/sensor-agent /usr/local/bin/sensor-agent
+RUN mkdir -p /var/lib/sensor-agent && chown sensoragent /var/lib/sensor-agent
+USER sensoragent
+
+ENV DEVICE_ID=rpi-sensor-01 \
+    SERVER_HOST=ingestion-service \
+    SERVER_PORT=9000 \
+    INTERVAL_MS=1000 \
+    WAL_PATH=/var/lib/sensor-agent/wal.log \
+    BATCH_SIZE=20
+
+ENTRYPOINT ["/usr/local/bin/sensor-agent"]
+
+# Build on the target machine with:
+#   docker build -f docker/Dockerfile.sensor-agent -t iot/sensor-agent:latest .

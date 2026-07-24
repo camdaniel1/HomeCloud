@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-api
+  namespace: iot-pipeline
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dashboard-api
+  template:
+    metadata:
+      labels:
+        app: dashboard-api
+    spec:
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: dashboard-api
+          image: iot/dashboard-api:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          env:
+            - name: LISTEN_PORT
+              value: "8080"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: raid-storage
+              mountPath: /data/ingest
+              readOnly: true
+          resources:
+            requests: { cpu: "100m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: raid-storage
+          persistentVolumeClaim:
+            claimName: raid-ingest-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-api
+  namespace: iot-pipeline
+spec:
+  selector:
+    app: dashboard-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

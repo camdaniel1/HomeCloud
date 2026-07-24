@@ -1,0 +1,59 @@
+# If your Raspberry Pi devices are joined to the Kubernetes cluster as arm64
+# nodes (e.g. via k3s), deploy the agent as a DaemonSet pinned to those nodes.
+# If the Pis are standalone (not cluster members), instead run the
+# sensor-agent image directly on-device with `docker run` / systemd and point
+# SERVER_HOST at the ingestion-service's external/NodePort address -- see
+# README.md "Standalone Raspberry Pi deployment".
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sensor-agent
+  namespace: iot-pipeline
+spec:
+  selector:
+    matchLabels:
+      app: sensor-agent
+  template:
+    metadata:
+      labels:
+        app: sensor-agent
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        node-role: sensor-device
+      initContainers:
+        - name: prepare-wal
+          image: alpine:3.20
+          command: ["sh", "-c", "chown -R 10001:10001 /var/lib/sensor-agent"]
+          volumeMounts:
+            - name: wal-storage
+              mountPath: /var/lib/sensor-agent
+      containers:
+        - name: sensor-agent
+          image: iot/sensor-agent:latest
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+          env:
+            - name: DEVICE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SERVER_HOST
+              value: "ingestion-service.iot-pipeline.svc.cluster.local"
+            - name: SERVER_PORT
+              value: "9000"
+            - name: INTERVAL_MS
+              value: "1000"
+          volumeMounts:
+            - name: wal-storage
+              mountPath: /var/lib/sensor-agent
+          resources:
+            requests: { cpu: "50m", memory: "16Mi" }
+            limits: { cpu: "200m", memory: "64Mi" }
+      volumes:
+        - name: wal-storage
+          hostPath:
+            path: /var/lib/sensor-agent
+            type: DirectoryOrCreate

@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: iot-pipeline
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: iot-pipeline
+data:
+  RAID_MOUNT_PATH: "/data/ingest"
+  SQL_SERVER_HOST: "sql-server.iot-pipeline.svc.cluster.local"
+  SQL_SERVER_DB: "IoTSensors"
+  CACHE_TTL_MS: "2000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sql-server-credentials
+  namespace: iot-pipeline
+type: Opaque
+stringData:
+  SQL_SERVER_USER: sa
+  SQL_SERVER_PASSWORD: "CHANGE_ME_use_a_real_secret_store"

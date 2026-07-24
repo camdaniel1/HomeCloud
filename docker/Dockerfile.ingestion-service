@@ -1,0 +1,47 @@
+# docker/Dockerfile.ingestion-service
+# Builds the ingestion service with SQL Server ODBC support.
+
+# ---- Stage 1: builder ----
+FROM debian:12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ unixodbc-dev curl gnupg ca-certificates \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
+    && curl https://packages.microsoft.com/config/debian/12/prod.list -o /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY common/ common/
+COPY ingestion-service/ ingestion-service/
+RUN mkdir -p /src/build && g++ -std=c++17 -O0 -g -DUSE_ODBC \
+    -o /src/build/ingestion-service ingestion-service/src/main.cpp -pthread -lodbc
+
+# Runtime keeps a normal Debian shell so container issues are easier to inspect.
+FROM debian:12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        unixodbc curl gnupg ca-certificates procps iproute2 \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
+    && curl https://packages.microsoft.com/config/debian/12/prod.list -o /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && apt-get purge -y curl gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+RUN useradd -r -M -u 10001 ingestion
+COPY --from=builder /src/build/ingestion-service /usr/local/bin/ingestion-service
+RUN mkdir -p /data/ingest && chown ingestion /data/ingest
+USER ingestion
+
+ENV LISTEN_PORT=9000 \
+    RAID_MOUNT_PATH=/data/ingest \
+    SQL_SERVER_HOST=sql-server \
+    SQL_SERVER_DB=IoTSensors
+
+EXPOSE 9000
+ENTRYPOINT ["/usr/local/bin/ingestion-service"]
+
+# docker build -f docker/Dockerfile.ingestion-service -t iot/ingestion-service:latest .
