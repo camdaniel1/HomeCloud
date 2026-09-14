@@ -1,228 +1,238 @@
-# IoT Sensor Pipeline with Fault Tolerance
+# IoT Sensor Pipeline
 
-An end-to-end pipeline that carries sensor readings from a Raspberry Pi device,
-through a Kubernetes-hosted ingestion layer, into a centralized SQL Server
-database, with a query API for dashboards. Built in C++.
+A small C++ project that sends simulated sensor readings through a simple data
+pipeline. You can run and debug the complete project locally before trying
+Docker, SQL Server, RAID, or Kubernetes.
 
-```
-Raspberry Pi (sensor-agent)
-      │  TCP, batched, WAL-buffered on failure
-      ▼
-Kubernetes: ingestion-service (Deployment, 3+ replicas)
-      │  writes to RAID-backed PVC first, then async to SQL Server
-      ▼                                   ▼
-RAID-backed PersistentVolume         SQL Server (dbo.SensorReadings)
-      ▲
-      │  journal queries, cached
-dashboard-api (Deployment, 2+ replicas)
+## How it works
+
+```text
+sensor-agent  -->  ingestion-service  -->  readings.tsv
+                                              |
+                                              v
+                                        dashboard-api
 ```
 
-## What's here
+The project contains three programs:
 
-| Path | What it is |
+1. `sensor-agent` creates temperature, humidity, pressure, vibration, and light
+   readings and sends them over TCP.
+2. `ingestion-service` checks each reading and saves it to `readings.tsv`.
+3. `dashboard-api` reads that file and returns the data as JSON over HTTP.
+
+If ingestion is unavailable, the agent saves readings in a local write-ahead
+log (WAL). It sends those readings again when ingestion comes back online.
+
+## Project layout
+
+| Path | Purpose |
 |---|---|
-| `common/protocol.hpp` | Shared wire-format struct (`SensorReading`) + CRC32 used by all three services |
-| `sensor-agent/` | Runs on the Raspberry Pi. Reads sensor values, batches, sends over TCP, buffers to a local write-ahead log (WAL) on failure |
-| `ingestion-service/` | Runs in Kubernetes. Accepts TCP batches, writes durably to a RAID-backed volume, then asynchronously to SQL Server |
-| `dashboard-api/` | Runs in Kubernetes. HTTP query API with a short-TTL in-memory cache for sub-second dashboard responses |
-| `sql/schema.sql` | SQL Server schema + indexes tuned for downstream analytics queries |
-| `docker/` | Straightforward Docker builds for the three services |
-| `k8s/` | Kubernetes manifests: namespace, RAID-backed StorageClass/PV/PVC, Deployments, Services, HPA, DaemonSet |
-| `scripts/setup-raid.sh` | Builds the fault-tolerant mdadm RAID array backing the ingest PVC |
-| `scripts/simulate-drive-failure.sh` | Fails/re-adds a disk to validate zero-downtime tolerance |
-| `scripts/load-test.sh` | Generates 50k+ readings/day of traffic and times dashboard queries |
+| `sensor-agent/src/main.cpp` | Creates and sends sensor readings |
+| `ingestion-service/src/main.cpp` | Receives batches and coordinates storage |
+| `ingestion-service/src/database.hpp` | File storage and optional SQL Server storage |
+| `dashboard-api/src/main.cpp` | Provides the HTTP API |
+| `common/protocol.hpp` | Shared reading format and CRC validation |
+| `sql/schema.sql` | Optional SQL Server schema |
+| `docker/` | Dockerfiles for all three programs |
+| `k8s/` | Optional Kubernetes configuration |
+| `scripts/` | Load testing and RAID helper scripts |
 
-## 1. Build
+## Requirements
 
-Requires a C++17 compiler and CMake 3.13+.
+For the basic local version, you need:
+
+- Linux or WSL
+- A C++17 compiler such as GCC
+- CMake 3.13 or newer
+- `curl` for testing the API
+
+SQL Server, Docker, Kubernetes, and physical sensors are not required for local
+development.
+
+## Build locally
+
+From the repository root:
 
 ```bash
-mkdir build && cd build
+mkdir build
+cd build
 cmake ..
-make -j
+cmake --build . -j
 ```
 
-This produces three binaries: `sensor-agent`, `ingestion-service`,
-`dashboard-api`. By default `ingestion-service`/`dashboard-api` use a
-file-backed mock database so you can run the whole pipeline locally without a
-SQL Server instance. To build against real SQL Server via ODBC:
+CMake creates a debug build by default. Compiler optimization is disabled and
+debug symbols are included.
 
-```bash
-# requires unixODBC dev headers + Microsoft ODBC Driver 18 for SQL Server installed
-cmake -DUSE_ODBC=ON ..
-make -j
+The build produces:
+
+```text
+build/sensor-agent
+build/ingestion-service
+build/dashboard-api
 ```
 
-For learning and debugging, start with the default file-backed build. The
-programs deliberately keep a simple control flow:
+## Run locally
 
-1. `sensor-agent` creates a batch and sends it, or saves it in its WAL.
-2. `ingestion-service` handles one connection at a time, writes the journal,
-   acknowledges it, and gives the batch to one SQL writer thread.
-3. `dashboard-api` reads that journal and returns JSON.
+Open three terminals in the repository root.
 
-The ODBC implementation is optional and is compiled only when `USE_ODBC=ON`.
-
-## 2. Run locally (no Kubernetes, no SQL Server)
+Start ingestion:
 
 ```bash
-# terminal 1
-RAID_MOUNT_PATH=/tmp/ingest ./build/ingestion-service
+RAID_MOUNT_PATH=/tmp/iot-data ./build/ingestion-service
+```
 
-# terminal 2
-RAID_MOUNT_PATH=/tmp/ingest ./build/dashboard-api
+Start the dashboard API:
 
-# terminal 3
-SERVER_HOST=127.0.0.1 SERVER_PORT=9000 DEVICE_ID=test-sensor-01 ./build/sensor-agent
+```bash
+RAID_MOUNT_PATH=/tmp/iot-data ./build/dashboard-api
+```
 
-# terminal 4 — query it
+Start one simulated sensor:
+
+```bash
+SERVER_HOST=127.0.0.1 \
+SERVER_PORT=9000 \
+DEVICE_ID=test-sensor-01 \
+INTERVAL_MS=1000 \
+BATCH_SIZE=5 \
+WAL_PATH=/tmp/iot-sensor-wal.log \
+./build/sensor-agent
+```
+
+The agent waits for a complete batch before sending it. With these settings,
+new data appears about every five seconds.
+
+## Test the API
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Latest ten readings
 curl "http://localhost:8080/api/readings/latest?limit=10"
+
+# Readings from one device
+curl "http://localhost:8080/api/readings/latest?device_id=test-sensor-01&limit=10"
+
+# Summary for the last hour
+curl "http://localhost:8080/api/readings/summary?device_id=test-sensor-01&window_minutes=60"
+
+# Temperature summary for the last hour
+curl "http://localhost:8080/api/readings/summary?sensor_type=temperature&window_minutes=60"
 ```
 
-Kill `ingestion-service` mid-run, watch `sensor-agent` start logging WAL
-buffering, then restart it — the buffered readings replay automatically.
+## Test failure recovery
 
-## 3. Set up the SQL Server database
+While the sensor agent is running:
+
+1. Stop `ingestion-service` with `Ctrl+C`.
+2. Wait long enough for the agent to create another batch.
+3. Check that `/tmp/iot-sensor-wal.log` was created.
+4. Restart `ingestion-service`.
+5. Watch the agent report that it is replaying buffered readings.
+6. Query the dashboard and confirm that the readings appear.
+
+This is the easiest way to understand and debug the fault-tolerance behavior.
+
+## Configuration
+
+### Sensor agent
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `DEVICE_ID` | `rpi-sensor-01` | Name stored with each reading |
+| `SERVER_HOST` | `ingestion-service` | Ingestion server hostname |
+| `SERVER_PORT` | `9000` | Ingestion TCP port |
+| `INTERVAL_MS` | `1000` | Time between generated readings |
+| `BATCH_SIZE` | `20` | Readings sent in one batch |
+| `WAL_PATH` | `/var/lib/sensor-agent/wal.log` | Local retry file |
+
+### Ingestion service
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LISTEN_PORT` | `9000` | TCP port used by sensor agents |
+| `RAID_MOUNT_PATH` | `/data/ingest` | Directory containing `readings.tsv` |
+
+### Dashboard API
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LISTEN_PORT` | `8080` | HTTP API port |
+| `RAID_MOUNT_PATH` | `/data/ingest` | Directory containing `readings.tsv` |
+| `CACHE_TTL_MS` | `2000` | How long API responses remain cached |
+
+## Debugging tips
+
+- Start with `BATCH_SIZE=1` so each reading is sent immediately.
+- Use a larger `INTERVAL_MS`, such as `5000`, when stepping through code.
+- Inspect saved readings with `tail -f /tmp/iot-data/readings.tsv`.
+- Give each test agent a different `DEVICE_ID`.
+- Debug one program while the other two run normally.
+
+The main path is intentionally direct. Ingestion handles one client at a time,
+writes the batch, acknowledges it, and places it on one SQL writer queue. SQL
+code is excluded from normal local builds.
+
+## Run a load test
+
+Start all three programs, then run:
 
 ```bash
-sqlcmd -S <your-sql-server-host> -U sa -P '<password>' -i sql/schema.sql
+./scripts/load-test.sh 10 1000 localhost:8080
 ```
 
-This creates `IoTSensors.dbo.SensorReadings` with indexes on
-`(DeviceId, ReadingTimeUtc)` and `(SensorType, ReadingTimeUtc)`, which is what
-keeps downstream analytics queries as index seeks (not table scans) as the
-table grows past 50,000 rows/day. The dashboard reads the RAID-backed durable
-journal, so it remains available during a SQL Server outage.
+This starts ten simulated agents, waits for data, measures five API requests,
+and stops the test agents when it finishes.
 
-## 4. Set up the fault-tolerant RAID storage
+## Optional: SQL Server
 
-On the Kubernetes node that will back the ingest `PersistentVolume`:
+Create the database:
 
 ```bash
-sudo DEVICES="/dev/sdb /dev/sdc /dev/sdd /dev/sde" ./scripts/setup-raid.sh
+sqlcmd -S <server> -U sa -P '<password>' -i sql/schema.sql
 ```
 
-Defaults to **RAID 10** (striped mirrors — tolerates a disk failure per
-mirror pair, good write throughput for continuous ingest). Set
-`RAID_LEVEL=6` for RAID 6 instead (tolerates any 2 simultaneous failures).
-Mounts the array at `/mnt/raid-array`, matching the `hostPath`/`local`
-volume referenced in `k8s/01-storage.yaml`.
-
-Validate fault tolerance (repeat against different member disks, 10+ times,
-ideally while `scripts/load-test.sh` is generating traffic):
+Build ingestion with ODBC support:
 
 ```bash
-sudo ./scripts/simulate-drive-failure.sh /dev/md0 /dev/sdc
+mkdir build-odbc
+cd build-odbc
+cmake -DUSE_ODBC=ON ..
+cmake --build . -j
 ```
 
-This fails a disk, confirms the array stays active/degraded (no downtime),
-writes a probe file to confirm the mount is still writable, removes the
-failed disk, then re-adds it (simulating a hot-swap) and starts the rebuild.
-See `docs/RAID.md` for more detail on the tradeoffs and how to interpret
-`mdadm --detail` output.
+This requires unixODBC development headers and Microsoft ODBC Driver 18.
+Configure it with `SQL_SERVER_HOST`, `SQL_SERVER_DB`, `SQL_SERVER_USER`, and
+`SQL_SERVER_PASSWORD`.
 
-## 5. Build and push the container images
+## Optional: Docker
+
+Build the images from the repository root:
 
 ```bash
-# Run this on the Raspberry Pi to build its native image
-docker build -f docker/Dockerfile.sensor-agent \
-  -t <registry>/iot/sensor-agent:latest .
-
-# ingestion-service (SQL Server via ODBC)
-docker build -f docker/Dockerfile.ingestion-service \
-  -t <registry>/iot/ingestion-service:latest .
-
-# dashboard-api
-docker build -f docker/Dockerfile.dashboard-api \
-  -t <registry>/iot/dashboard-api:latest .
-
-# Push after each local build has been tested
-docker push <registry>/iot/sensor-agent:latest
-docker push <registry>/iot/ingestion-service:latest
-docker push <registry>/iot/dashboard-api:latest
+docker build -f docker/Dockerfile.sensor-agent -t iot/sensor-agent:latest .
+docker build -f docker/Dockerfile.ingestion-service -t iot/ingestion-service:latest .
+docker build -f docker/Dockerfile.dashboard-api -t iot/dashboard-api:latest .
 ```
 
-The images use normal Debian-based build and runtime stages. The binaries keep
-debug symbols and the server images include ordinary troubleshooting tools,
-which makes failures easier to reproduce and inspect inside a container.
+The sensor image builds for the machine running Docker. Build it on a Raspberry
+Pi when you need a Raspberry Pi image.
 
-## 6. Deploy to Kubernetes
+## Optional: Kubernetes and RAID
+
+The `k8s` directory contains deployments for a larger environment. Before
+applying them, replace the placeholder image names, SQL password, storage size,
+and storage-node hostname.
 
 ```bash
 kubectl apply -f k8s/00-namespace-config.yaml
 kubectl apply -f k8s/01-storage.yaml
 kubectl apply -f k8s/02-ingestion-service.yaml
 kubectl apply -f k8s/03-dashboard-api.yaml
-
-# If your Pis are cluster-joined arm64 nodes (e.g. k3s):
-kubectl apply -f k8s/04-sensor-agent-daemonset.yaml
 ```
 
-Before applying, edit:
-- `k8s/00-namespace-config.yaml` — real SQL Server credentials (use a proper
-  secret store in production, this is a placeholder)
-- `k8s/01-storage.yaml` — the `nodeAffinity` hostname(s) for your
-  RAID-equipped storage node(s)
-- `k8s/02-ingestion-service.yaml` / `03-dashboard-api.yaml` — your image
-  registry paths
-
-### Standalone Raspberry Pi deployment (not cluster-joined)
-
-If the Pi isn't a Kubernetes node, run the agent directly on-device instead
-of the DaemonSet:
-
-```bash
-docker run -d --restart unless-stopped \
-  -e DEVICE_ID=rpi-greenhouse-01 \
-  -e SERVER_HOST=<ingestion-service external/NodePort address> \
-  -e SERVER_PORT=9000 \
-  -v /var/lib/sensor-agent:/var/lib/sensor-agent \
-  <registry>/iot/sensor-agent:latest
-```
-
-Expose `ingestion-service` externally (`type: LoadBalancer` or `NodePort`) if
-the Pi is outside the cluster network.
-
-## 7. Validate the throughput / latency targets
-
-```bash
-./scripts/load-test.sh 10 1000 localhost:8080
-```
-
-Runs 10 simulated sensor-agents at 1 reading/sec each (≈864,000 readings/day,
-well above the 50,000/day target), then times 5 sequential
-`GET /api/readings/latest` calls against `dashboard-api` to confirm sub-second
-response times.
-
-## API reference (dashboard-api)
-
-| Endpoint | Description |
-|---|---|
-| `GET /health` | Liveness/readiness check |
-| `GET /api/readings/latest?device_id=<id>&limit=<n>` | Most recent `n` readings, optionally filtered by device |
-| `GET /api/readings/summary?device_id=<id>&sensor_type=<type>&window_minutes=<n>` | Count, average, minimum, and maximum over a recent time window |
-
-Responses are read from the durable ingest journal and served from a 2-second in-memory cache by default
-(`CACHE_TTL_MS`), so repeated dashboard polling does not repeatedly scan the journal
-while still refreshing fast enough for a live view.
-
-## How each requirement is met
-
-**Throughput / latency** — `sensor-agent` batches readings and ships them
-over a persistent TCP connection; `ingestion-service` ACKs after a local
-durable write and hands off to SQL Server asynchronously, so ingest
-throughput isn't gated by database latency. `dashboard-api` serves reads from
-the RAID-backed journal behind a short-TTL cache. SQL Server has covering
-indexes (`sql/schema.sql`) for downstream analytics over accumulated history.
-
-**Fault tolerance / zero downtime** — Three layers: (1) `sensor-agent`'s WAL
-survives Pi reboots and network/ingestion outages; (2) `ingestion-service`
-runs as a 3-replica Deployment behind a Service, and only ACKs after a
-successful write to the RAID-backed volume; (3) the RAID array itself
-(RAID 10 or RAID 6, `scripts/setup-raid.sh`) tolerates single-disk failure
-with the array staying active/degraded, validated repeatedly with
-`scripts/simulate-drive-failure.sh`.
-
-**Debugging** — CMake defaults to a debug build. Container binaries are also
-built with debug symbols and without compiler optimization, and the server
-images use a regular Debian shell with basic process and network tools.
+Apply `k8s/04-sensor-agent-daemonset.yaml` only when Raspberry Pi devices are
+Kubernetes nodes. RAID setup and failure simulation are described in
+[`docs/RAID.md`](docs/RAID.md). These operations modify real disks, so use them
+only on a dedicated test or deployment machine.
